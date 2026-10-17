@@ -141,6 +141,11 @@ def test_make_feature_matrix_with_lookback(person_df, condition_df, drug_df):
             3: pd.Timestamp("2020-06-01"),
         }
     )
+    # Windowed features need condition start dates; without them the function now
+    # raises instead of silently skipping the temporal filter.
+    condition_df = condition_df.assign(
+        condition_start_date=pd.to_datetime(["2020-01-01"] * len(condition_df))
+    )
     result = make_feature_matrix(
         person_df, condition_df, drug_df, lookback_days=365, index_dates=index_dates
     )

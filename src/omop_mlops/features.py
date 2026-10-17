@@ -12,10 +12,43 @@ import pandas as pd
 from omop_mlops.constants import CHARLSON_ICD9_GROUPS
 
 
+def normalize_icd(code: object) -> str:
+    """Normalize an ICD-9/10 code for prefix matching.
+
+    Removes dots and surrounding whitespace and upper-cases the result, so
+    ``"250.0"``, ``"250.00"`` and MIMIC's ``"25000"`` all compare on the same
+    footing.
+    """
+    return str(code).strip().replace(".", "").upper()
+
+
+def _pre_index_mask(
+    df: pd.DataFrame,
+    date_col: str,
+    index_dates: pd.Series,
+    lookback_days: int | None,
+) -> pd.Series:
+    """Boolean mask: rows dated strictly BEFORE each person's index date.
+
+    When *lookback_days* is given, rows older than that window are also
+    excluded.  Persons missing from *index_dates* get no rows (NaT compares
+    False), which avoids silently admitting undated history.
+    """
+    dates = pd.to_datetime(df[date_col])
+    index_for_row = df["person_id"].map(index_dates)
+    mask = dates < index_for_row
+    if lookback_days is not None:
+        cutoff = index_for_row - pd.to_timedelta(lookback_days, unit="D")
+        mask &= dates >= cutoff
+    return mask.fillna(False).astype(bool)
+
+
 def comorbidity_flags(
     condition_df: pd.DataFrame,
     person_ids: list[int] | pd.Index,
     mapping: dict[str, list[str]] | None = None,
+    index_dates: pd.Series | None = None,
+    lookback_days: int | None = None,
 ) -> pd.DataFrame:
     """Compute Boolean comorbidity flags per person from condition_occurrence rows.
 
@@ -23,13 +56,22 @@ def comorbidity_flags(
     ----------
     condition_df:
         OMOP ``condition_occurrence`` table.  Must contain ``person_id`` and
-        ``condition_source_value`` (ICD-9/10 string).
+        ``condition_source_value`` (ICD-9/10 string).  When ``index_dates`` is
+        given it must also contain ``condition_start_date``.
     person_ids:
         Universe of person IDs to include (rows with no matching conditions get
         all-False flags).
     mapping:
         ``{comorbidity_name: [icd_prefix, ...]}``.  Defaults to
-        :data:`~omop_mlops.constants.CHARLSON_ICD9_GROUPS`.
+        :data:`~omop_mlops.constants.CHARLSON_ICD9_GROUPS`.  Prefixes are
+        matched after normalization (dots removed), so ``"250.0"`` matches
+        MIMIC's ``"25000"``.
+    index_dates:
+        ``pd.Series`` indexed by ``person_id`` with the prediction timepoint.
+        Only conditions starting strictly before it are counted.
+    lookback_days:
+        Restrict to conditions within this many days before ``index_dates``.
+        Ignored when ``index_dates`` is ``None``.
 
     Returns
     -------
@@ -40,22 +82,24 @@ def comorbidity_flags(
         mapping = CHARLSON_ICD9_GROUPS
 
     person_ids = pd.Index(person_ids).unique()
-    result = pd.DataFrame({"person_id": person_ids})
-    result = result.set_index("person_id")
+    df = condition_df[condition_df["person_id"].isin(person_ids)].copy()
 
-    for label, prefixes in mapping.items():
-        has_condition = (
-            condition_df[condition_df["person_id"].isin(person_ids)]
-            .assign(
-                _match=condition_df["condition_source_value"].apply(
-                    lambda v: any(str(v).startswith(p) for p in prefixes)
-                )
+    if index_dates is not None:
+        if "condition_start_date" not in df.columns:
+            raise KeyError(
+                "condition_df must contain 'condition_start_date' when index_dates is given."
             )
-            .query("_match")
-            .groupby("person_id")["_match"]
-            .any()
-        )
-        result[label] = result.index.map(has_condition).fillna(False).astype(bool)
+        df = df[_pre_index_mask(df, "condition_start_date", index_dates, lookback_days)]
+
+    codes = df["condition_source_value"].map(normalize_icd).astype(str)
+
+    result = pd.DataFrame({"person_id": person_ids}).set_index("person_id")
+    for label, prefixes in mapping.items():
+        match = pd.Series(False, index=df.index)
+        for prefix in prefixes:
+            match |= codes.str.startswith(normalize_icd(prefix))
+        has_condition = df.loc[match.astype(bool), "person_id"].drop_duplicates()
+        result[label] = result.index.isin(has_condition)
 
     return result.reset_index()
 
@@ -96,11 +140,7 @@ def medication_counts(
 
     if index_dates is not None:
         df["drug_exposure_start_date"] = pd.to_datetime(df["drug_exposure_start_date"])
-        df["_index_date"] = df["person_id"].map(index_dates)
-        df = df[df["drug_exposure_start_date"] < df["_index_date"]]
-        if lookback_days is not None:
-            cutoff = df["_index_date"] - pd.to_timedelta(lookback_days, unit="D")
-            df = df[df["drug_exposure_start_date"] >= cutoff]
+        df = df[_pre_index_mask(df, "drug_exposure_start_date", index_dates, lookback_days)]
 
     counts = (
         df.groupby("person_id")["drug_concept_id"]
@@ -117,6 +157,8 @@ def aggregate_measurements(
     measurement_df: pd.DataFrame,
     person_ids: list[int] | pd.Index,
     agg: tuple[str, ...] = ("mean", "min", "max"),
+    index_dates: pd.Series | None = None,
+    lookback_days: int | None = None,
 ) -> pd.DataFrame:
     """Pivot and aggregate numeric measurements per person.
 
@@ -124,11 +166,18 @@ def aggregate_measurements(
     ----------
     measurement_df:
         OMOP ``measurement`` table.  Must contain ``person_id``,
-        ``measurement_concept_id``, and ``value_as_number``.
+        ``measurement_concept_id``, and ``value_as_number``.  When
+        ``index_dates`` is given it must also contain ``measurement_date``.
     person_ids:
         Universe of person IDs.
     agg:
         Aggregation functions to apply (any pandas groupby agg names).
+    index_dates:
+        ``pd.Series`` indexed by ``person_id`` with the prediction timepoint.
+        Only measurements taken strictly before it are aggregated.
+    lookback_days:
+        Restrict to measurements within this many days before ``index_dates``.
+        Ignored when ``index_dates`` is ``None``.
 
     Returns
     -------
@@ -138,6 +187,14 @@ def aggregate_measurements(
     """
     person_ids = pd.Index(person_ids).unique()
     df = measurement_df[measurement_df["person_id"].isin(person_ids)].copy()
+
+    if index_dates is not None:
+        if "measurement_date" not in df.columns:
+            raise KeyError(
+                "measurement_df must contain 'measurement_date' when index_dates is given."
+            )
+        df = df[_pre_index_mask(df, "measurement_date", index_dates, lookback_days)]
+
     df["value_as_number"] = pd.to_numeric(df["value_as_number"], errors="coerce")
     df = df.dropna(subset=["value_as_number"])
 
@@ -164,7 +221,7 @@ def make_feature_matrix(
 ) -> pd.DataFrame:
     """Join comorbidities, medication counts, and measurements into one feature matrix.
 
-    Temporal validity: when ``index_dates`` is provided, each sub-function
+    Temporal validity: when ``index_dates`` is provided, every sub-function
     receives it so only data recorded BEFORE the prediction timepoint is used.
     This prevents label leakage.
 
@@ -191,7 +248,9 @@ def make_feature_matrix(
     """
     person_ids = person_df["person_id"].unique()
 
-    comorbidity_df = comorbidity_flags(condition_df, person_ids)
+    comorbidity_df = comorbidity_flags(
+        condition_df, person_ids, index_dates=index_dates, lookback_days=lookback_days
+    )
     drug_count_df = medication_counts(
         drug_df, person_ids, lookback_days=lookback_days, index_dates=index_dates
     )
@@ -199,7 +258,12 @@ def make_feature_matrix(
     result = comorbidity_df.merge(drug_count_df, on="person_id", how="outer")
 
     if measurement_df is not None and not measurement_df.empty:
-        meas_df = aggregate_measurements(measurement_df, person_ids)
+        meas_df = aggregate_measurements(
+            measurement_df,
+            person_ids,
+            index_dates=index_dates,
+            lookback_days=lookback_days,
+        )
         result = result.merge(meas_df, on="person_id", how="left")
 
     # Ensure every person_id from person_df appears exactly once
